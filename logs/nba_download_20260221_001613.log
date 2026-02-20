@@ -1,0 +1,2 @@
+/Users/akshatporwal/Documents/projects/NBA_ML/collect_nba_api_data.py:122: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  "updated_at": dt.datetime.utcnow().isoformat(),

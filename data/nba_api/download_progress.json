@@ -1,0 +1,10 @@
+{
+  "completed_tasks": {},
+  "seasons": {
+    "2016-17": {
+      "error_message": "KeyboardInterrupt",
+      "status": "interrupted",
+      "updated_at": "2026-02-20T13:23:49.922551+00:00"
+    }
+  }
+}
