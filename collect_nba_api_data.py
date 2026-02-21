@@ -8,6 +8,7 @@ import hashlib
 import inspect
 import json
 import sqlite3
+import socket
 import time
 import traceback
 from pathlib import Path
@@ -20,7 +21,50 @@ from requests.exceptions import ConnectionError as RequestsConnectionError
 from requests.exceptions import ReadTimeout as RequestsReadTimeout
 
 
-DEFAULT_RATE_LIMIT_SECONDS = 0.6
+DEFAULT_RATE_LIMIT_SECONDS = 1.2
+
+
+def enable_ipv4_only() -> None:
+    """Force IPv4 DNS results to avoid unstable IPv6 routes."""
+    original_getaddrinfo = socket.getaddrinfo
+
+    def getaddrinfo_ipv4(host, port, family=0, type=0, proto=0, flags=0):
+        return original_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
+
+    socket.getaddrinfo = getaddrinfo_ipv4
+
+
+def patch_nba_api_session() -> None:
+    """Inject required headers and a per-request session factory into NBAStatsHTTP.
+
+    stats.nba.com will silently hang (ReadTimeout) when:
+    - the x-nba-stats-token / x-nba-stats-origin gating headers are absent, or
+    - a stale keep-alive connection is reused after the server closes it.
+    Both problems are fixed here.
+    """
+    from nba_api.stats.library.http import NBAStatsHTTP
+
+    # Extend the existing headers with the gating headers NBA.com requires.
+    extra_headers = {
+        "x-nba-stats-token": "true",
+        "x-nba-stats-origin": "stats",
+        "Origin": "https://www.nba.com",
+        "Sec-Fetch-Site": "same-site",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Ch-Ua-Platform": '"Windows"',
+    }
+    NBAStatsHTTP.headers = {**NBAStatsHTTP.headers, **extra_headers}
+
+    # Return a *fresh* session for every call so stale keep-alive sockets
+    # never cause a silent hang waiting for a response that will never arrive.
+    @classmethod  # type: ignore[misc]
+    def _fresh_session(cls):  # noqa: N805
+        session = requests.Session()
+        session.headers.update(cls.headers)
+        return session
+
+    NBAStatsHTTP.get_session = _fresh_session
+    print("[PATCH] NBAStatsHTTP patched: required headers injected, per-call session enabled.")
 
 
 MODEL_1_ENDPOINTS = {
@@ -91,14 +135,15 @@ class ProgressTracker:
 
     def _load(self) -> dict:
         if not self.progress_path.exists():
-            return {"seasons": {}, "completed_tasks": {}}
+            return {"seasons": {}, "completed_tasks": {}, "cursors": {}}
         try:
             with self.progress_path.open("r", encoding="utf-8") as file:
                 state = json.load(file)
         except (json.JSONDecodeError, OSError):
-            return {"seasons": {}, "completed_tasks": {}}
+            return {"seasons": {}, "completed_tasks": {}, "cursors": {}}
         state.setdefault("seasons", {})
         state.setdefault("completed_tasks", {})
+        state.setdefault("cursors", {})
         return state
 
     def _save(self) -> None:
@@ -155,6 +200,29 @@ class ProgressTracker:
             completed.append(task_hash)
             self._save()
 
+    # ------------------------------------------------------------------
+    # Loop-level cursors: track how many entities (players/teams/games)
+    # have been fully processed so long loops resume exactly where they
+    # left off without re-checking individual task hashes.
+    # ------------------------------------------------------------------
+
+    def get_cursor(self, season: str, model: str, loop_name: str) -> int:
+        """Return the number of entities already fully processed (= resume index)."""
+        key = f"{season}::{model}::{loop_name}"
+        return self.state["cursors"].get(key, 0)
+
+    def advance_cursor(self, season: str, model: str, loop_name: str) -> None:
+        """Increment the cursor after one entity has been fully processed."""
+        key = f"{season}::{model}::{loop_name}"
+        self.state["cursors"][key] = self.state["cursors"].get(key, 0) + 1
+        self._save()
+
+    def reset_cursor(self, season: str, model: str, loop_name: str) -> None:
+        """Reset the cursor for a loop (use when replaying a season from scratch)."""
+        key = f"{season}::{model}::{loop_name}"
+        self.state["cursors"].pop(key, None)
+        self._save()
+
 
 def save_frames(frames: list[pd.DataFrame], out_dir: Path, name: str, fmt: str) -> None:
     ensure_dir(out_dir)
@@ -186,6 +254,9 @@ class StorageWriter:
         self.db_path = db_path
         self.fmt = fmt
         self.conn: sqlite3.Connection | None = None
+        # Maps table_name -> set of column names already in the DB schema.
+        # Updated when columns are added so ALTER TABLE is only run when needed.
+        self._table_cache: dict[str, set[str]] = {}
 
         if self.storage_mode in {"db", "both"}:
             ensure_dir(self.db_path.parent)
@@ -196,23 +267,7 @@ class StorageWriter:
 
     def _create_tables(self) -> None:
         assert self.conn is not None
-        self.conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS nba_data (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                season TEXT NOT NULL,
-                model TEXT NOT NULL,
-                dataset TEXT NOT NULL,
-                frame_index INTEGER NOT NULL,
-                team_id INTEGER,
-                player_id INTEGER,
-                game_id TEXT,
-                request_json TEXT NOT NULL,
-                row_json TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            )
-            """
-        )
+        # ingestion_log: one row per endpoint call for observability.
         self.conn.execute(
             """
             CREATE TABLE IF NOT EXISTS ingestion_log (
@@ -229,6 +284,71 @@ class StorageWriter:
             """
         )
         self.conn.commit()
+        # Warm the column cache for any flat tables already in the DB.
+        for (tbl,) in self.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'nba__%'"
+        ):
+            cols = {row[1] for row in self.conn.execute(f'PRAGMA table_info("{tbl}")')}
+            self._table_cache[tbl] = cols
+
+    # ------------------------------------------------------------------
+    # Dynamic per-dataset flat tables
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _table_name(dataset: str) -> str:
+        """Convert a dataset name to a safe SQLite table name prefixed with nba__."""
+        safe = "".join(c if (c.isalnum() or c == "_") else "_" for c in dataset.lower())
+        return f"nba__{safe}"
+
+    def _ensure_flat_table(self, dataset: str, frame: pd.DataFrame) -> str:
+        """Create or extend the flat table for this dataset, returning the table name.
+
+        - On first call for a dataset: CREATE TABLE with metadata + data columns.
+        - On subsequent calls where the frame has new columns (e.g. different season):
+          ALTER TABLE ADD COLUMN so the schema evolves automatically.
+        - All data columns are stored as TEXT; SQLite affinity handles numeric queries.
+        """
+        table = self._table_name(dataset)
+        assert self.conn is not None
+        frame_cols = set(frame.columns)
+
+        if table not in self._table_cache:
+            # First time seeing this table in this process: query the DB.
+            existing_cols = {row[1] for row in self.conn.execute(f'PRAGMA table_info("{table}")')}
+            if not existing_cols:
+                meta = (
+                    "_season TEXT NOT NULL, "
+                    "_model TEXT NOT NULL, "
+                    "_frame_index INTEGER NOT NULL, "
+                    "_created_at TEXT NOT NULL"
+                )
+                data_cols = ", ".join(f'"{c}" TEXT' for c in frame.columns)
+                self.conn.execute(
+                    f'CREATE TABLE "{table}" '
+                    f"(id INTEGER PRIMARY KEY AUTOINCREMENT, {meta}, {data_cols})"
+                )
+                self.conn.commit()
+                self._table_cache[table] = set(frame.columns)
+            else:
+                # Table exists; add any columns absent from the DB schema.
+                new_cols = [c for c in frame.columns if c not in existing_cols]
+                if new_cols:
+                    for col in new_cols:
+                        self.conn.execute(f'ALTER TABLE "{table}" ADD COLUMN "{col}" TEXT')
+                    self.conn.commit()
+                self._table_cache[table] = existing_cols | frame_cols
+        else:
+            # Table known; only ALTER if this frame introduces columns we haven't seen.
+            known_cols = self._table_cache[table]
+            new_cols = [c for c in frame.columns if c not in known_cols]
+            if new_cols:
+                for col in new_cols:
+                    self.conn.execute(f'ALTER TABLE "{table}" ADD COLUMN "{col}" TEXT')
+                self.conn.commit()
+                self._table_cache[table] = known_cols | frame_cols
+
+        return table
 
     def write_endpoint(
         self,
@@ -252,44 +372,42 @@ class StorageWriter:
         frames: list[pd.DataFrame],
         request_params: dict,
     ) -> None:
+        """Write API response frames into per-dataset flat tables.
+
+        Each dataset gets its own table (e.g. nba__team_stats_advanced) with one
+        column per API field.  Metadata columns (_season, _model, _frame_index,
+        _created_at) are prepended.  New columns from later seasons are added via
+        ALTER TABLE ADD COLUMN so the schema evolves automatically.
+        """
         assert self.conn is not None
         created_at = dt.datetime.now(dt.UTC).isoformat()
-        request_json = json.dumps(request_params, default=str)
 
         row_count = 0
         try:
             for frame_index, frame in enumerate(frames, start=1):
                 if frame.empty:
                     continue
+                table = self._ensure_flat_table(dataset, frame)
+                cols = list(frame.columns)
+                # Build INSERT once per frame (column list is stable within a frame).
+                col_list = ", ".join(f'"{c}"' for c in cols)
+                placeholders = ", ".join(["?"] * (4 + len(cols)))
+                insert_sql = (
+                    f'INSERT INTO "{table}" '
+                    f"(_season, _model, _frame_index, _created_at, {col_list}) "
+                    f"VALUES ({placeholders})"
+                )
                 records = []
                 for row in frame.to_dict(orient="records"):
-                    team_id = row.get("TEAM_ID")
-                    player_id = row.get("PLAYER_ID")
-                    game_id = row.get("GAME_ID")
-                    records.append(
-                        (
-                            season,
-                            model,
-                            dataset,
-                            frame_index,
-                            int(team_id) if pd.notna(team_id) else None,
-                            int(player_id) if pd.notna(player_id) else None,
-                            str(game_id) if pd.notna(game_id) else None,
-                            request_json,
-                            json.dumps(row, default=str),
-                            created_at,
-                        )
+                    meta = (season, model, frame_index, created_at)
+                    data = tuple(
+                        None if (v is None or (isinstance(v, float) and v != v))
+                        else v
+                        for v in (row[c] for c in cols)
                     )
+                    records.append(meta + data)
                 row_count += len(records)
-                self.conn.executemany(
-                    """
-                    INSERT INTO nba_data (
-                        season, model, dataset, frame_index, team_id, player_id, game_id,
-                        request_json, row_json, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    records,
-                )
+                self.conn.executemany(insert_sql, records)
             self.conn.execute(
                 """
                 INSERT INTO ingestion_log (
@@ -406,7 +524,12 @@ def collect_shot_charts_for_teams(
     request_timeout_s: int,
 ) -> None:
     team_data = teams.get_teams()
-    for team in team_data:
+    done = progress.get_cursor(season, model, "shot_chart_teams")
+    if done:
+        print(f"[RESUME] shot_chart_teams: skipping first {done}/{len(team_data)} teams")
+    for i, team in enumerate(team_data):
+        if i < done:
+            continue
         call_endpoint(
             endpoints.ShotChartDetail,
             storage,
@@ -423,6 +546,7 @@ def collect_shot_charts_for_teams(
             team_id=team["id"],
             player_id=0,
         )
+        progress.advance_cursor(season, model, "shot_chart_teams")
 
 
 def collect_team_specific_endpoints(
@@ -439,7 +563,12 @@ def collect_team_specific_endpoints(
     request_timeout_s: int,
 ) -> None:
     team_data = teams.get_teams()
-    for team in team_data:
+    done = progress.get_cursor(season, model, "team_specific")
+    if done:
+        print(f"[RESUME] team_specific: skipping first {done}/{len(team_data)} teams")
+    for i, team in enumerate(team_data):
+        if i < done:
+            continue
         team_id = team["id"]
         call_endpoint(
             endpoints.TeamDashboardByGeneralSplits,
@@ -476,6 +605,7 @@ def collect_team_specific_endpoints(
             per_mode_detailed=per_mode,
             group_quantity=5,
         )
+        progress.advance_cursor(season, model, "team_specific")
 
 
 def collect_player_specific(
@@ -501,7 +631,12 @@ def collect_player_specific(
     else:
         selected = all_players
 
-    for player in selected:
+    done = progress.get_cursor(season, model, "players")
+    if done:
+        print(f"[RESUME] players: skipping first {done}/{len(selected)} players")
+    for i, player in enumerate(selected):
+        if i < done:
+            continue
         player_id = player["id"]
         call_endpoint(
             endpoints.CommonPlayerInfo,
@@ -580,6 +715,7 @@ def collect_player_specific(
                 team_id=0,
                 season=season,
             )
+        progress.advance_cursor(season, model, "players")
 
 
 def collect_matchups_from_games(
@@ -594,8 +730,13 @@ def collect_matchups_from_games(
     request_timeout_s: int,
 ) -> None:
     log = endpoints.LeagueGameLog(season=season)
-    games = log.get_data_frames()[0]
-    for game_id in games["GAME_ID"].unique():
+    game_ids = sorted(log.get_data_frames()[0]["GAME_ID"].unique())
+    done = progress.get_cursor(season, model, "matchup_games")
+    if done:
+        print(f"[RESUME] matchup_games: skipping first {done}/{len(game_ids)} games")
+    for i, game_id in enumerate(game_ids):
+        if i < done:
+            continue
         call_endpoint(
             endpoints.BoxScoreMatchupsV3,
             storage,
@@ -610,6 +751,7 @@ def collect_matchups_from_games(
             request_timeout_s=request_timeout_s,
             game_id=game_id,
         )
+        progress.advance_cursor(season, model, "matchup_games")
 
 
 def parse_args() -> argparse.Namespace:
@@ -633,6 +775,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-retries", type=int, default=3, help="Retries for timeout/network errors per call.")
     parser.add_argument("--retry-backoff", type=float, default=2.0, help="Base seconds for exponential retry backoff.")
     parser.add_argument("--request-timeout", type=int, default=45, help="HTTP timeout seconds per API request.")
+    parser.add_argument("--force-ipv4", action="store_true", help="Force IPv4 to avoid problematic IPv6 routing.")
     parser.add_argument(
         "--progress-path",
         default=None,
@@ -643,6 +786,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.force_ipv4:
+        enable_ipv4_only()
+        print("[INFO] IPv4-only mode enabled")
+    patch_nba_api_session()
     seasons = resolve_seasons(args.past_seasons, args.start_year, args.end_year)
     base_dir = Path(args.output_dir)
     db_path = Path(args.db_path)

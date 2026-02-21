@@ -39,6 +39,7 @@ echo "[INFO] Progress file: ${PROGRESS_PATH}"
 echo "[INFO] Python: ${PYTHON_BIN}"
 echo "[INFO] Command: ${CMD[*]}"
 echo "[INFO] Press Ctrl+C to interrupt safely and resume later."
+echo "[INFO] Tip: add --force-ipv4 if requests keep timing out after moving networks."
 echo
 
 if ! "${PYTHON_BIN}" -c "import pandas" >/dev/null 2>&1; then
