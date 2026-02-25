@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from collect_nba_api_data import StorageWriter
+from src.collect_nba_api_data import StorageWriter
 
 
 def main() -> None:
