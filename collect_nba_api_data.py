@@ -756,9 +756,10 @@ def collect_matchups_from_games(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Collect NBA API data and store in consolidated relations.")
-    parser.add_argument("--past-seasons", type=int, default=10, help="How many past seasons to fetch.")
-    parser.add_argument("--start-year", type=int, default=None, help="Season start year (e.g., 2014).")
-    parser.add_argument("--end-year", type=int, default=None, help="Season start year (e.g., 2023).")
+    # Default to only the 2024-25 season for development/testing runs.
+    parser.add_argument("--past-seasons", type=int, default=1, help="How many past seasons to fetch.")
+    parser.add_argument("--start-year", type=int, default=2024, help="Season start year (e.g., 2014).")
+    parser.add_argument("--end-year", type=int, default=2024, help="Season start year (e.g., 2023).")
     parser.add_argument("--storage-mode", choices=["db", "files", "both"], default="db")
     parser.add_argument("--db-path", default="data/nba_data.sqlite", help="Path to SQLite database.")
     parser.add_argument("--output-dir", default="data/nba_api", help="Base output directory for file mode.")
