@@ -68,10 +68,10 @@ def patch_nba_api_session() -> None:
     }
     NBAStatsHTTP.headers = {**NBAStatsHTTP.headers, **extra_headers}
 
-    @classmethod  # type: ignore[misc]
-    def _fresh_session(cls):  # noqa: N805
+    def _fresh_session():  # no-arg function to match NBAStatsHTTP.get_session signature
         session = requests.Session()
-        session.headers.update(cls.headers)
+        # use the class headers directly to avoid a 'cls' parameter mismatch
+        session.headers.update(NBAStatsHTTP.headers)
         return session
 
     NBAStatsHTTP.get_session = _fresh_session
@@ -442,7 +442,8 @@ class StorageWriter:
             ),
         )
         self.conn.commit()
-        return int(cur.lastrowid)
+        # sqlite3.Cursor.lastrowid can be None in some cases; return Optional[int]
+        return int(cur.lastrowid) if cur.lastrowid is not None else None
 
     def finish_status_success(
         self,
@@ -717,7 +718,7 @@ def sync_cursor_with_db(
     entity_type: str,
     ordered_entity_ids: list[str],
     required_datasets: list[str],
-) -> int:
+):
     db_done = storage.compute_resume_index(
         season=season,
         model=model,
@@ -1244,7 +1245,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--end-year", type=int, default=2024, help="Season start year (e.g., 2023).")
     parser.add_argument("--storage-mode", choices=["db", "files", "both"], default="db")
     parser.add_argument("--db-path", default="data/nba_data.sqlite", help="Path to SQLite database.")
-    parser.add_argument("--output-dir", default="data/nba_api", help="Base output directory for file mode.")
+    parser.add_argument("--output-dir", default="data", help="Base output directory for file mode.")
     parser.add_argument("--format", choices=["csv", "parquet"], default="csv", help="Output file format for file mode.")
     parser.add_argument("--season-type", default="Regular Season", help="Season type (Regular Season/Playoffs).")
     parser.add_argument("--per-mode", default="PerGame", help="Per-mode for league dash endpoints.")
